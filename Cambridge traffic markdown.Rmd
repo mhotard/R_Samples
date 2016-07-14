@@ -1,0 +1,178 @@
+---
+title: "Cambridge Traffic"
+output: html_document
+---
+
+This document explores traffic accidents in Cambridge, MA from 2010 to 2013. We want to see if there are any discernible patterns in the number of accidents. 
+
+First we have to load the data. The data was originally exported from https://data.cambridgema.gov/Public-Safety/Accident-Map-2010-2013/4tke-xhvq to a csv format and then loaded into R. We should also load some of the libraries required. 
+
+```{r }
+setwd("~/Documents/Cambridge Traffic Data")
+df = read.csv("ACCIDENT-2010-2013.csv", header=TRUE)
+```
+
+```{r results='hide', message=FALSE} 
+
+library(dplyr)
+library(ggplot2)
+require(ggplot2)
+require(sandwich)
+require(msm)
+```
+
+Next we can do some initial exploratory analysis to see what the dataset contains. 
+
+```{r }
+str(df)
+head(df)
+```
+
+
+We won't be mapping the data today, but we can try to see if there are any patterns for the accidents based on the day of the week or time of day. 
+
+First let's check out a bar plot for the days of the week:
+
+```{r }
+barplot(table(df$Day.Of.Week))
+```
+
+This shows us that not all of the days were coded. But there is a time stamp for each event we can use to code the days ourselves. We can use R time formatting to pull out the day of the week and the time of each crash. 
+
+```{r}
+
+#reformatting the time stamp into R time codes
+times <- as.POSIXct(df$Date.Time, format='%m/%d/%Y %I:%M:%S %p')
+
+#getting the weekday of the crashes
+weekday <- weekdays(as.Date(times))
+
+#getting the hour of the crashes
+hours <- format(times, format='%H')
+
+#getting the days of the crashes
+days <- format(times, format='%m/%d/%Y')
+
+#adding our new columns to the dataframe for analysis
+df$days <- days
+df$hours <- hours
+df$weekday <- weekday
+str(df)
+```
+
+We will have to convert the weekday and hour variables to factors so they can be used more easily in the analysis. 
+
+```{r}
+
+#converting some columns to factors
+df$weekday <- factor(df$weekday, levels=c("Monday", "Tuesday", "Wednesday", 
+                                          "Thursday", "Friday", "Saturday", "Sunday"), ordered=T)
+df$hour <- factor(df$hour)
+```
+
+
+Now let's visualize the crashes by day and hour. We might see a similar pattern per day, but it could vary. Perhaps the weekends have fewer crashes because traffic volume decreases. We would also expect there to be fluctuations in the crashes based on the time of day. 
+
+To do this, we will manipulate the data witht the plyr groupby function and then graph the data using ggplot. 
+
+```{r}
+#let's do some analysis by hours and days of the week
+#using plyr's groupby, we will get counts for each hour of each day
+hour_week <- group_by(df, weekday, hour)
+hour_week_crash <- summarize(hour_week, count=n())
+
+#turn the plyer class into a dataframe
+df_hour <- data.frame(hour_week_crash)
+
+#use ggplot for some nice visuals
+p <- ggplot(data = df_hour, aes(x=hour)) 
+p <- p + geom_bar(aes(weights=count, fill=weekday))
+p <- p + scale_fill_brewer(palette="Set3")
+p <- p + facet_wrap( ~ weekday, ncol=1)
+p
+```
+
+
+As we expected! The weekdays show similar patterns, but there seems to be fewer crashes on the weekends. 
+
+Let's see if we can quantify the likely number of crashes on a given day of the week. 
+
+We will have to manipulate the data to a slightly different format to just group it by days. We will also have to fill in the days that there were zero accidents. They do not show up in our data, but 0 is a valid observation for a day. 
+
+```{r}
+
+df_group_days <- group_by(df, days)
+df_days <- data.frame(summarize(df_group_days, count=n()))
+str(df_days)
+
+times <- as.POSIXct(df_days$days, format='%m/%d/%Y')
+df_days$dates <- times
+
+#have to create a full dataset and merge it with the crash data
+full_days <- seq(as.Date("2010/1/1"), as.Date("2013/12/31"), "days")
+df2 <- data.frame(full_days)
+#making the df_days column match the df2 column
+df_days$dates <- as.Date(substr(df_days$dates, 1, 10))
+#merging the two data frames
+df_days <- merge(df_days, df2, by.x='dates', by.y='full_days', all.y=TRUE)
+
+#set the NAs to 0
+df_days$count[is.na(df_days$count)] <- 0
+df_days$weekday <- weekdays(df_days$dates)
+```
+
+Let's do some initial exploratory analysis on the new data frame. It appears that there is a difference depending on the day of the week. The mean is 4.34 crashes per day. 
+
+```{r}
+
+#exploratory analysis on our variable of interest
+#count data
+#appears to be distributed poisson as expected for count data
+table(df_days$count)
+barplot(table(df_days$count))
+#mean is approximately 4.339 crashes a day, but it does have a high variance
+summary(df_days$count)
+var(df_days$count)
+```
+
+Let's do a regression to see more about this relationship. We have count data, so we should probably use a poisson. However, our high variances shows that we should use a quasipoisson. This accounts for some of the overdispersion in the model. Let's analyze this using R's GLM function. 
+
+```{r}
+
+df_days$weekday <- factor(df_days$weekday)
+test <- glm(count ~ weekday, df_days, family=quasipoisson())
+summary(test)
+```
+
+We do have some significance on the factors. However, we should calculate robust standard errors and form some condifence intervals. 
+
+```{r}
+
+#getting robust standard errors
+cov.test <- vcovHC(test, type="HC0")
+std.err <- sqrt(diag(cov.test))
+r.est <- cbind(Estimate= coef(test), "Robust SE" = std.err,
+               "Pr(>|z|)" = 2 * pnorm(abs(coef(test)/std.err), lower.tail=FALSE),
+               LL = coef(test) - 1.96 * std.err,
+               UL = coef(test) + 1.96 * std.err)
+r.est
+```
+
+But what does does this tell us? We have to take the exponential to determine the actual estimated accidents per day. 
+
+In our analysis, Friday was used as the base day. We have to manipulate the data some to get the results in an easy to understand way. 
+
+```{r }
+exp(r.est[2:7,4] + r.est[1,4])
+exp(r.est[2:7,5] + r.est[1,5])
+#Friday Data
+exp(r.est[1,4])
+exp(r.est[1,5])
+```
+
+This shows the the expected accidents for Monday will be between 3.6 and 5.1 approximately 95% of the time. On Fridays, you would normally expect between 4.9 and 5.7 accidents. However, on a Sunday, you would only expect 2.5 to 3.7 accidents. 
+
+Additional analysis with this data set could try to account for season (perhaps winter has more accidents because road conditions are more hazardous), weather (merge a dataset with weather for Cambridge), or use the GIS data that was in the initial dataset. 
+
+
+This anaylsis was performed with the help of: http://www.ats.ucla.edu/stat/r/dae/poissonreg.htm and http://stackoverflow.com/questions/14818529/plot-histograms-over-factor-variables.
